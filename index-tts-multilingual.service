@@ -1,0 +1,34 @@
+[Unit]
+Description=index-tts multilingual API server (18 langs, single-engine LoRA routing, port 5113)
+Wants=network-online.target
+After=network-online.target
+# start after the other GPU tenants so VRAM is in a known state at boot
+After=llm_text.service llm_text3.service style.service
+# drop-in replacement: same port 5113 as the other two TTS units. Conflicts= is
+# symmetric in systemd, so starting this unit stops index-tts-updated (and
+# starting index-tts-updated stops this one) — the flip and the rollback are
+# each a single systemctl start.
+Conflicts=index-tts-updated.service index-tts.service
+# never give up restarting (long outages beat a dead TTS service)
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=forsen
+WorkingDirectory=/home/forsen/repos/index-tts-ml
+Environment="PYTHONUNBUFFERED=1"
+# don't start until enough VRAM is actually free (boot race / previous instance
+# still releasing memory after a crash). Measured need: ~14.6GiB at
+# --mel_workers 2, so 15000MiB is the floor, not the target.
+ExecStartPre=/home/forsen/repos/index-tts-ml/wait_for_vram.sh 15000 300
+ExecStart=/bin/bash /home/forsen/repos/index-tts-ml/run_multilingual.sh
+Restart=on-failure
+# a dying vLLM EngineCore needs several seconds to release VRAM; restarting
+# after 5s made the new instance race its own corpse
+RestartSec=30s
+# model load + torch.compile warmup takes minutes on cold cache
+TimeoutStartSec=900
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
