@@ -1,160 +1,151 @@
-> **This fork** ([Shiro836/index-tts-vllm](https://github.com/Shiro836/index-tts-vllm)) runs as the production TTS engine of a Twitch-overlay service and diverges from upstream. Changes on top of upstream:
->
-> - Ported to vLLM 0.22.1 (v1 `AsyncLLM` engine); GPT decode tuned with full CUDA-graph capture and async scheduling
-> - **`/tts_stream`** — NDJSON streaming endpoint: one standalone WAV chunk per sentence, first audio as soon as the first sentence is synthesized, client disconnect cancels the remaining vLLM decodes
-> - Sentence-level time marks: `return_segments` on `/tts_url`; `start`/`end` inline on every stream chunk
-> - Per-voice reference-conditioning LRU cache (keyed on path + mtime + size), request-invariant conditioning hoisted out of the sentence loop
-> - Synchronous GPU sections (GPT forward, s2mel diffusion, BigVGAN, reference computation) run on a worker pool (`--mel_workers`) instead of the event loop, so concurrent requests no longer stall each other — addresses upstream's "V2 api concurrency" TODO
-> - Ops: explicit KV-cache budget (`--kv_cache_memory_bytes`) for deterministic boot next to other GPU services, lazy Qwen emotion engine (`--qwen_emo_mode`), `--ref_device`, hardened systemd units for side-by-side deployment
->
-> Upstream docs continue below; English version: [README_EN.md](README_EN.md).
+# Index-TTS2 CUDA
 
-<a href="README.md">中文</a> ｜ <a href="README_EN.md">English</a>
+High-throughput, low-latency serving engine for **Index-TTS2** (multilingual base + merged LoRA routing) powered by a zero-dependency custom C++/CUDA GPT-2 inference engine (`sm_89` / `sm_120`) and a TF32 Tensor-Core `s2mel` + `BigVGAN` pipeline.
 
-<div align="center">
+Replaces the `vLLM` subprocess and duplicate PyTorch GPT-2 copies with a single in-process `2.7 GiB` CUDA library, cutting VRAM by **~4.5–8.8 GiB** and boosting end-to-end TTS throughput by **1.5×–3.0×** with zero precision degradation (GPT in exact FP16, `s2mel` / `BigVGAN` / `conformer` / `semantic_codec` strictly in FP32/TF32 — never FP16).
 
-# IndexTTS-vLLM
-</div>
+---
 
-## 项目简介
-该项目在 [index-tts](https://github.com/index-tts/index-tts) 的基础上使用 vllm 库重新实现了 gpt 模型的推理，加速了 index-tts 的推理过程。
+## Highlights
 
-推理速度（Index-TTS-v1/v1.5）在单卡 RTX 4090 上的提升为：
-- 单个请求的 RTF (Real-Time Factor)：≈0.3 -> ≈0.1
-- 单个请求的 gpt 模型 decode 速度：≈90 token / s -> ≈280 token / s
-- 并发量：gpu_memory_utilization 设置为 0.25（约5GB显存）的情况下，实测 16 左右的并发无压力（测速脚本参考 `simple_test.py`）
+- **Zero-dependency C++/CUDA GPT-2 engine (`csrc/gpt_engine/`)**
+  - Fatbin compiled for Ada Lovelace (`sm_89`), Blackwell (`sm_120`), and `compute_89` PTX.
+  - Holds both pristine base (`en`/`zh`) and merged adapter (16 routed languages) weights in FP16 with zero runtime LoRA/Punica overhead, deduplicating the 201 shared tensors across models.
+  - Static KV cache (`max_batch=4, max_seq_len=1818`), async micro-batching scheduler, and a decoupled `gpt.forward()` workspace so latent passes run concurrently with autoregressive decode.
+  - Custom CUDA-graphed kernels: 1-warp zero-smem LayerNorm + fused double-LN (`ln_f → final_norm`), multi-vector FP16 GEMVs, Split-K=16 Flash-Decode attention, and 1024-thread in-GPU top-k / top-p / temperature / repetition-penalty (`10.0`) sampling with zero per-token CPU-GPU sync.
+- **Optimized FP32/TF32 `s2mel` + `BigVGAN` Pipeline**
+  - Custom `sm_89` TF32 Tensor-Core FlashAttention-2 (`D=64`, FP32 I/O) registered as `torch.ops.indextts.tf32_sdpa_d64` (full-graph `torch.compile` compatible, **2.9× faster** than PyTorch scalar-FP32 SDPA).
+  - Weight-norm folding at load time, unmasked SDPA, cached timestep / AdaLN / WaveNet projections, hoisted step-invariant input projections out of the Euler ODE loop, cached speaker `emovec`, fast-path English text normalization, and per-worker CUDA streams with multi-sentence pipelining.
+- **Drop-in HTTP API & Instant Rollback**
+  - Preserves `/health`, `/tts_url`, `/tts_stream` (NDJSON sentence streaming), GlotLID multilingual routing, and optional CTC `code_aligner` word timings.
+  - Every optimization is env-gated (`GPT_ENGINE=cuda|vllm`, `S2MEL_STEPS`, `S2MEL_OPT`, `TTS_TF32`, `TTS_STREAMS`).
 
-## 更新日志
+---
 
-- **[2025-09-22]** 支持了 vllm v1 版本，IndexTTS2 正在兼容中
+## Benchmarks
 
-- **[2025-09-28]** 支持了 IndexTTS2 的 webui 推理，并整理了权重文件，现在部署更加方便了！ \0.0/ ；但当前版本对于 IndexTTS2 的 gpt 似乎并没有加速效果，待研究
+### Standalone Custom CUDA GPT-2 Engine (`tests/test_cuda_gpt_engine.py`)
+*Exact FP16 (964.7 MB weights streamed/token), `max_batch=4`, `max_seq_len=1818`, total GPT VRAM = **2.70 GiB** for both base + merged adapter + KV cache:*
 
-- **[2025-09-29]** 解决了 IndexTTS2 的 gpt 模型推理加速无效的问题
+| GPU | `B=1` Decode (base & adapter) | `B=2` Aggregate | `B=3` Aggregate | `B=4` Aggregate | `gpt_forward` (`T=256 / 512 / 1024`) |
+|---|---:|---:|---:|---:|---:|
+| **RTX 5090** (400W) | **984 tok/s** | **1,916 tok/s** | **2,776 tok/s** | **3,532 tok/s** | `3.5 / 7.9 / 21.2 ms` |
+| **RTX 4090** (`sm_89`, live prod) | **730–734 tok/s** | — | — | — | — |
 
-- **[2025-10-09]** 兼容 IndexTTS2 的 api 接口调用，请参考 [API](#api)；v1/1.5 的 api 接口以及 openai 兼容的接口可能还有 bug，晚点再修
+### End-to-End Multilingual TTS (`bench_suite.py`, RTX 5090)
+*Compared against single-engine vLLM LoRA baseline (`S2MEL_STEPS=12`, `S2MEL_COMPILE=1`, `BIGVGAN_CUDA_KERNEL=1`, `mel_workers=4`, `code_aligner` enabled):*
 
-- **[2025-10-19]** 支持 qwen0.6bemo4-merge 的 vllm 推理
+| Workload | Baseline (`vLLM`, `steps=12`) | **CUDA Engine (`steps=12`)** | **CUDA Engine (`steps=18`, default)** | Speedup (`steps=12` / `18`) |
+|---|---:|---:|---:|---:|
+| `en_short` (~3s) | `465 ms` | **`261 ms`** | **`306 ms`** | **`1.78×`** / **`1.52×`** |
+| `en_med` (~11s) | `1,237 ms` | **`790 ms`** | **`820 ms`** | **`1.57×`** / **`1.51×`** |
+| `en_long` (~25s, 2 sents, TTFA / total) | `1,626` / `2,025 ms` | **`926` / `1,134 ms`** | **`1,075` / `1,381 ms`** | **`1.79×`** / **`1.47×`** |
+| `ru_short` (~4.5s, adapter) | `955 ms` | **`320 ms`** | **`440 ms`** | **`2.99×`** / **`2.17×`** |
+| `ru_med` (~9.5s, adapter) | `1,616 ms` | **`676 ms`** | **`798 ms`** | **`2.39×`** / **`2.03×`** |
+| `zh_short` (~5s) | `723 ms` | **`462 ms`** | **`397 ms`** | **`1.57×`** / **`1.82×`** |
+| **`burst4`** (2 EN + 2 RU, wall / mean TTFA) | `1,588` / `1,322 ms` | **`847` / `636 ms`** | **`968` / `706 ms`** | **`1.87×–2.08×`** / **`1.64×–1.87×`** |
+| **Cold load + warmup** | `177.5 s` | **`42.6 s`** | **`33.9 s`** | **`4.2×–5.2×`** |
+| **VRAM savings** | — | **`-4.5 GiB`** (5090) / **`-8.8 GiB`** (4090 prod) | **`-4.4 GiB`** (5090) / **`-8.8 GiB`** (4090 prod) | — |
 
-## TODO list
-- V2 api 的并发优化：目前只有 gpt2 模型的推理是并行的，其他模块均是串行，而其中 s2mel 的推理开销大（需要 DiT 迭代 25 步），十分影响并发性能
+### Numerical & Audio Quality Parity
+- **GPT-2 (`base` & `adapter`):** `gpt_forward` cosine vs PyTorch FP32 = **`0.999998`**, prefill logits cosine = **`0.999997`** (`top-1` exact), 32-step greedy decode = **`32/32` exact**, `B=4 == B=1` bit-exact.
+- **`s2mel` (`S2MEL_OPT=1 + TTS_TF32=1 + TF32-FA2`):** mel cosine vs FP32 baseline = **`0.9999999`**.
+- **`BigVGAN` (`TTS_TF32=1`):** waveform cosine = **`0.999957`**, mel cosine = **`0.9999997`**, SNR = **`40.6 dB`**.
+- **End-to-end A/B (`tests/eval_quality.py`):** CAMPPlus speaker similarity `0.811` (baseline `0.784`), SQUIM PESQ `2.58` (baseline `2.50`), zero clipping, verified with `openai/whisper-large-v3` across EN/RU/ZH.
 
-- s2mel 的推理加速
+---
 
-## 使用步骤
+## Quick Start
 
-### 1. git 本项目
-```bash
-git clone https://github.com/Ksuriuri/index-tts-vllm.git
-cd index-tts-vllm
-```
-
-
-### 2. 创建并激活 conda 环境
-```bash
-conda create -n index-tts-vllm python=3.12
-conda activate index-tts-vllm
-```
-
-
-### 3. 安装 pytorch
-
-需要 pytorch 版本 2.8.0（对应 vllm 0.10.2），具体安装指令请参考：[pytorch 官网](https://pytorch.org/get-started/locally/)
-
-
-### 4. 安装依赖
-```bash
-pip install -r requirements.txt
-```
-
-
-### 5. 下载模型权重
-
-#### 自动下载（推荐）
-
-选择对应版本的模型权重下载到 `checkpoints/` 路径下：
+### 1. Build the CUDA Engine
+Requires CUDA toolkit (`nvcc`) and a compatible C++ host compiler (defaults to `/opt/cuda/bin/nvcc` and `/usr/bin/g++-15`; override via `NVCC` / `CXX`):
 
 ```bash
-# Index-TTS
-modelscope download --model kusuriuri/Index-TTS-vLLM --local_dir ./checkpoints/Index-TTS-vLLM
-
-# IndexTTS-1.5
-modelscope download --model kusuriuri/Index-TTS-1.5-vLLM --local_dir ./checkpoints/Index-TTS-1.5-vLLM
-
-# IndexTTS-2
-modelscope download --model kusuriuri/IndexTTS-2-vLLM --local_dir ./checkpoints/IndexTTS-2-vLLM
+bash csrc/gpt_engine/build.sh
 ```
 
-#### 手动下载
+This compiles `csrc/gpt_engine/libindextts_gpt.so` and verifies `sm_89` / `sm_120` / `compute_89` PTX presence via `cuobjdump`.
 
-- ModelScope：[Index-TTS](https://www.modelscope.cn/models/kusuriuri/Index-TTS-vLLM) | [IndexTTS-1.5](https://www.modelscope.cn/models/kusuriuri/Index-TTS-1.5-vLLM) | [IndexTTS-2](https://www.modelscope.cn/models/kusuriuri/IndexTTS-2-vLLM)
-
-#### 自行转换原权重（可选，不推荐）
-
-可以使用 `convert_hf_format.sh` 自行转换官方权重文件：
+### 2. Run the API Server
 
 ```bash
-bash convert_hf_format.sh /path/to/your/model_dir
+export GPT_ENGINE=cuda        # cuda | vllm (rollback)
+export TTS_TF32=1             # TF32 for FP32 s2mel/BigVGAN (never FP16)
+export S2MEL_OPT=1            # hoisted invariants + unmasked TF32-FA2
+export S2MEL_COMPILE=1        # torch.compile DiT step
+export S2MEL_STEPS=18         # 12 (fastest), 18 (default), 25 (max steps)
+export TTS_STREAMS=1          # dedicated worker CUDA streams
+export BIGVGAN_CUDA_KERNEL=1  # fused anti-alias activation kernel
+
+python api_server_v2.py \
+  --host 0.0.0.0 --port 5113 \
+  --base_model_dir /path/to/models/base_pristine \
+  --adapter_model_dir /path/to/models/lora_step12000 \
+  --lid_model /path/to/models/glotlid/model.bin \
+  --qwen_emo_mode disabled \
+  --ref_cache_size 32 \
+  --mel_workers 4 \
+  --code_aligner /path/to/code_aligner.pt \
+  --code_aligner_threads 8
 ```
 
-### 6. webui 启动！
+For single-model mode (without multilingual routing), pass `--model_dir /path/to/model` instead of `--base_model_dir` / `--adapter_model_dir` / `--lid_model`.
 
-运行对应版本（第一次启动可能会久一些，因为要对 bigvgan 进行 cuda 核编译）：
+### 3. Tests & Benchmarks
 
 ```bash
-# Index-TTS 1.0
-python webui.py
+# GPT-2 parity, VRAM gate, and B=1..4 throughput
+python tests/test_cuda_gpt_engine.py
 
-# IndexTTS-1.5
-python webui.py --version 1.5
+# End-to-end latency, RTF, burst-4 concurrency, and WAV generation
+python bench_suite.py --label run1 --out bench_out/run1.json --wav-dir bench_out/wavs
 
-# IndexTTS-2
-python webui_v2.py
+# HTTP API smoke test (/health, /tts_url, /tts_stream)
+python tests/test_api_smoke.py
 ```
 
+---
 
-## API
+## API Reference
 
-使用 fastapi 封装了 api 接口，启动示例如下：
+- **`GET /health`** — returns engine status, mode (`dual`/`single`), active backend (`cuda`/`vllm`), and VRAM usage.
+- **`POST /tts_url`** — synthesizes full audio; returns `audio/wav` bytes (or JSON with base64 `audio`, `sampling_rate`, and word-timed `segments` when `"return_segments": true`).
+- **`POST /tts_stream`** — streams sentence chunks as NDJSON (`{"text", "language", "start", "end", "words", "sampling_rate", "audio"}`), terminated by `{"done": true}`.
 
+Example request:
 ```bash
-# Index-TTS-1.0/1.5
-python api_server.py
-
-# IndexTTS-2
-python api_server_v2.py
+curl -X POST http://127.0.0.1:5113/tts_url \
+  -H "Content-Type: application/json" \
+  -d '{"spk_audio_path": "/path/to/ref.wav", "text": "Hello from the custom CUDA engine."}' \
+  --output out.wav
 ```
 
-### 启动参数
-- `--model_dir`: 必填，模型权重路径
-- `--host`: 服务ip地址，默认为 `0.0.0.0`
-- `--port`: 服务端口，默认为 `6006`
-- `--gpu_memory_utilization`: vllm 显存占用率，默认设置为 `0.25`
+---
 
-### API 请求示例
-- v1/1.5 请参考 `api_example.py`
-- v2 请参考 `api_example_v2.py`
+## Configuration & Rollback
 
-### OpenAI API
-- 添加 /audio/speech api 路径，兼容 OpenAI 接口
-- 添加 /audio/voices api 路径， 获得 voice/character 列表
+| Env Var | Default | Description |
+|---|---|---|
+| `GPT_ENGINE` | `vllm` (`cuda` in `run_multilingual.sh`) | `cuda` for custom `sm_89` engine, `vllm` for instant rollback |
+| `GPT_CUDA_MAX_BATCH` | `4` | Static KV cache slot count (keep `<= 4` for `<= 2.8 GiB` VRAM) |
+| `S2MEL_STEPS` | `25` (`18` in `run_multilingual.sh`) | Euler ODE diffusion steps (`12` / `18` / `25`) |
+| `S2MEL_OPT` | `0` (`1` in `run_multilingual.sh`) | Hoisted DiT invariants, weight-norm removal, custom TF32-FA2 |
+| `S2MEL_COMPILE` | `0` (`1` in `run_multilingual.sh`) | `torch.compile(fullgraph=True, dynamic=True)` on DiT step |
+| `TTS_TF32` | `0` (`1` in `run_multilingual.sh`) | TF32 matmul & cuDNN acceleration for FP32 `s2mel`/`BigVGAN` |
+| `TTS_STREAMS` | `0` (`1` in `run_multilingual.sh`) | Dedicated per-worker CUDA streams + multi-sentence tail pipelining |
+| `BIGVGAN_CUDA_KERNEL` | `0` (`1` in `run_multilingual.sh`) | Fused BigVGAN anti-alias activation CUDA extension |
 
-详见：[createSpeech](https://platform.openai.com/docs/api-reference/audio/createSpeech)
+---
 
-## 新特性
-- **v1/v1.5:** 支持多角色音频混合：可以传入多个参考音频，TTS 输出的角色声线为多个参考音频的混合版本（输入多个参考音频会导致输出的角色声线不稳定，可以抽卡抽到满意的声线再作为参考音频）
+## Repository Layout
 
-## 性能
-Word Error Rate (WER) Results for IndexTTS and Baseline Models on the [**seed-test**](https://github.com/BytedanceSpeech/seed-tts-eval)
+- `csrc/gpt_engine/` — custom CUDA C++ GPT-2 engine, TF32 FlashAttention-2 kernel, and fatbin build script
+- `indextts/gpt/cuda_gpt_engine.py` — ctypes wrapper, async micro-batching scheduler, and `indextts::tf32_sdpa_d64` op
+- `indextts/infer_vllm_v2.py` & `indextts/gpt/model_vllm_v2.py` — pipeline integration & dual-view routing
+- `indextts/s2mel/` — optimized `s2mel` DiT / WaveNet / BigVGAN modules
+- `api_server_v2.py` — FastAPI server (`/health`, `/tts_url`, `/tts_stream`)
+- `tests/` & `bench_suite.py` — parity, quality, smoke, and end-to-end benchmark suites
 
-| model                   | zh    | en    |
-| ----------------------- | ----- | ----- |
-| Human                   | 1.254 | 2.143 |
-| index-tts (num_beams=3) | 1.005 | 1.943 |
-| index-tts (num_beams=1) | 1.107 | 2.032 |
-| index-tts-vllm      | 1.12  | 1.987 |
+## Credits & License
 
-基本保持了原项目的性能
-
-## 并发测试
-参考 [`simple_test.py`](simple_test.py)，需先启动 API 服务
+Built on top of [Index-TTS](https://github.com/index-tts/index-tts) and [index-tts-vllm](https://github.com/Ksuriuri/index-tts-vllm). See [LICENSE](LICENSE) and [INDEX_MODEL_LICENSE](INDEX_MODEL_LICENSE).
