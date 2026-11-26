@@ -2,7 +2,7 @@
 
 High-throughput, low-latency serving engine for **Index-TTS2** (multilingual base + merged LoRA routing) powered by a zero-dependency custom C++/CUDA GPT-2 inference engine (`sm_89` / `sm_120`) and a TF32 Tensor-Core `s2mel` + `BigVGAN` pipeline.
 
-Replaces the `vLLM` subprocess and duplicate PyTorch GPT-2 copies with a single in-process `2.7 GiB` CUDA library, cutting VRAM by **~4.5–8.8 GiB** and boosting end-to-end TTS throughput by **1.5×–3.0×** with zero precision degradation (GPT in exact FP16, `s2mel` / `BigVGAN` / `conformer` / `semantic_codec` strictly in FP32/TF32 — never FP16).
+Replaces the `vLLM` subprocess and duplicate PyTorch GPT-2 copies with a single in-process `2.7 GiB` CUDA library, cutting VRAM by **~4.5–6.0 GiB** and boosting end-to-end TTS throughput by **1.5×–3.0×** with zero precision degradation (GPT in exact FP16, `s2mel` / `BigVGAN` / `conformer` / `semantic_codec` strictly in FP32/TF32 — never FP16).
 
 ---
 
@@ -45,7 +45,7 @@ Replaces the `vLLM` subprocess and duplicate PyTorch GPT-2 copies with a single 
 | `zh_short` (~5s) | `723 ms` | **`462 ms`** | **`397 ms`** | **`1.57×`** / **`1.82×`** |
 | **`burst4`** (2 EN + 2 RU, wall / mean TTFA) | `1,588` / `1,322 ms` | **`847` / `636 ms`** | **`968` / `706 ms`** | **`1.87×–2.08×`** / **`1.64×–1.87×`** |
 | **Cold load + warmup** | `177.5 s` | **`42.6 s`** | **`33.9 s`** | **`4.2×–5.2×`** |
-| **VRAM savings** | — | **`-4.5 GiB`** (5090) / **`-8.8 GiB`** (4090 prod) | **`-4.4 GiB`** (5090) / **`-8.8 GiB`** (4090 prod) | — |
+| **VRAM savings** | — | **`-4.5 GiB`** (`15.6 → 11.1 GiB`) | **`-4.4 GiB`** (`15.6 → 11.2 GiB`; `11.6 GiB` live on 4090) | — |
 
 ### Numerical & Audio Quality Parity
 - **GPT-2 (`base` & `adapter`):** `gpt_forward` cosine vs PyTorch FP32 = **`0.999998`**, prefill logits cosine = **`0.999997`** (`top-1` exact), 32-step greedy decode = **`32/32` exact**, `B=4 == B=1` bit-exact.
