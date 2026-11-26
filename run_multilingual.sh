@@ -26,12 +26,13 @@ export S2MEL_STEPS="${S2MEL_STEPS:-18}"
 export S2MEL_COMPILE="${S2MEL_COMPILE:-1}"
 export BIGVGAN_CUDA_KERNEL="${BIGVGAN_CUDA_KERNEL:-1}"
 
-# Custom sm_89 CUDA GPT-2 engine + TF32/hoisted s2mel + dedicated streams.
-# Instant rollback to vLLM + baseline s2mel:
-#   GPT_ENGINE=vllm TTS_TF32=0 S2MEL_OPT=0 TTS_STREAMS=0
+# Custom sm_89 CUDA GPT-2 engine + hoisted/BF16 s2mel + dedicated streams.
+# Instant rollback:
+#   GPT_ENGINE=vllm TTS_TF32=0 S2MEL_OPT=0 S2MEL_BF16=0 TTS_STREAMS=0
 export GPT_ENGINE="${GPT_ENGINE:-cuda}"
 export TTS_TF32="${TTS_TF32:-1}"
 export S2MEL_OPT="${S2MEL_OPT:-1}"
+export S2MEL_BF16="${S2MEL_BF16:-1}"
 export TTS_STREAMS="${TTS_STREAMS:-1}"
 
 # --single_engine_lora is the production mode (UNPACK.md): ONE vLLM engine holds

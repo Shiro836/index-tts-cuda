@@ -13,12 +13,12 @@ Replaces the `vLLM` subprocess and duplicate PyTorch GPT-2 copies with a single 
   - Holds both pristine base (`en`/`zh`) and merged adapter (16 routed languages) weights in FP16 with zero runtime LoRA/Punica overhead, deduplicating the 201 shared tensors across models.
   - Static KV cache (`max_batch=4, max_seq_len=1818`), async micro-batching scheduler, and a decoupled `gpt.forward()` workspace so latent passes run concurrently with autoregressive decode.
   - Custom CUDA-graphed kernels: 1-warp zero-smem LayerNorm + fused double-LN (`ln_f → final_norm`), multi-vector FP16 GEMVs, Split-K=16 Flash-Decode attention, and 1024-thread in-GPU top-k / top-p / temperature / repetition-penalty (`10.0`) sampling with zero per-token CPU-GPU sync.
-- **Optimized FP32/TF32 `s2mel` + `BigVGAN` Pipeline**
-  - Custom `sm_89` TF32 Tensor-Core FlashAttention-2 (`D=64`, FP32 I/O) registered as `torch.ops.indextts.tf32_sdpa_d64` (full-graph `torch.compile` compatible, **2.9× faster** than PyTorch scalar-FP32 SDPA).
+- **Optimized `s2mel` + `BigVGAN` Pipeline (never FP16)**
+  - `s2mel` CFM supports `S2MEL_BF16=1` (BF16 weights/compute with FP32 Tensor Core accumulation, native FlashAttention-2 BF16, and FP32 Euler ODE state; `mel_cos = 0.99999`) or `S2MEL_BF16=0` (custom `sm_89` TF32 Tensor-Core FlashAttention-2 `torch.ops.indextts.tf32_sdpa_d64`, **2.9× faster** than PyTorch scalar-FP32 SDPA). `BigVGAN`, `conformer`, and `semantic_codec` remain strictly FP32/TF32.
   - Weight-norm folding at load time, unmasked SDPA, cached timestep / AdaLN / WaveNet projections, hoisted step-invariant input projections out of the Euler ODE loop, cached speaker `emovec`, fast-path English text normalization, and per-worker CUDA streams with multi-sentence pipelining.
 - **Drop-in HTTP API & Instant Rollback**
   - Preserves `/health`, `/tts_url`, `/tts_stream` (NDJSON sentence streaming), GlotLID multilingual routing, and optional CTC `code_aligner` word timings.
-  - Every optimization is env-gated (`GPT_ENGINE=cuda|vllm`, `S2MEL_STEPS`, `S2MEL_OPT`, `TTS_TF32`, `TTS_STREAMS`).
+  - Every optimization is env-gated (`GPT_ENGINE=cuda|vllm`, `S2MEL_STEPS`, `S2MEL_OPT`, `S2MEL_BF16`, `TTS_TF32`, `TTS_STREAMS`).
 
 ---
 
@@ -70,8 +70,9 @@ This compiles `csrc/gpt_engine/libindextts_gpt.so` and verifies `sm_89` / `sm_12
 
 ```bash
 export GPT_ENGINE=cuda        # cuda | vllm (rollback)
-export TTS_TF32=1             # TF32 for FP32 s2mel/BigVGAN (never FP16)
-export S2MEL_OPT=1            # hoisted invariants + unmasked TF32-FA2
+export TTS_TF32=1             # TF32 for FP32 BigVGAN/conformer/s2mel (never FP16)
+export S2MEL_OPT=1            # hoisted invariants + unmasked SDPA
+export S2MEL_BF16=1           # BF16->FP32 CFM with FP32 Euler ODE (0 = TF32-FA2)
 export S2MEL_COMPILE=1        # torch.compile DiT step
 export S2MEL_STEPS=18         # 12 (fastest), 18 (default), 25 (max steps)
 export TTS_STREAMS=1          # dedicated worker CUDA streams

@@ -483,6 +483,17 @@ class IndexTTS2:
         self.s2mel = s2mel.to(self.device)
         if self.is_fp16:
             _half_with_fp32_layernorm(self.s2mel)
+        self._s2mel_bf16 = os.environ.get("S2MEL_BF16") == "1" and not self.is_fp16
+        if self._s2mel_bf16:
+            # Force FP32 Tensor Core accumulation so BF16 hits the full-rate bf16/f32 path without reduced-precision drift.
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+            self.s2mel.models['cfm'] = self.s2mel.models['cfm'].to(torch.bfloat16)
+            est = self.s2mel.models['cfm'].estimator
+            for te_name in ("t_embedder", "t_embedder2"):
+                te = getattr(est, te_name, None)
+                if te is not None and hasattr(te, "freqs"):
+                    te.freqs = te.freqs.float()
+            logger.info(">> s2mel CFM enabled in BF16->FP32 (S2MEL_BF16=1; BigVGAN/conformer/semantic_codec remain FP32/TF32)")
         # real upper bound is prompt_condition + 1.72 * codes ≈ 2.4k positions at the
         # 120-token sentence cap; 8192 wasted a few hundred MB of preallocated cache
         self.s2mel.models['cfm'].estimator.setup_caches(max_batch_size=1, max_seq_length=4096)
@@ -866,11 +877,23 @@ class IndexTTS2:
                                                              n_quantizers=3,
                                                              f0=None)[0]
                 cat_condition = torch.cat([prompt_condition, cond], dim=1)
-                vc_target = self.s2mel.models['cfm'].inference(cat_condition,
-                                                               torch.LongTensor([cat_condition.size(1)]).to(
-                                                                   cond.device),
-                                                               ref_mel, style, None, diffusion_steps,
-                                                               inference_cfg_rate=inference_cfg_rate)
+                if self._s2mel_bf16:
+                    dev_type = self.device.split(":")[0] if isinstance(self.device, str) else self.device.type
+                    with torch.amp.autocast(dev_type, dtype=torch.bfloat16):
+                        vc_target = self.s2mel.models['cfm'].inference(
+                            cat_condition,
+                            torch.LongTensor([cat_condition.size(1)]).to(cond.device),
+                            ref_mel, style, None, diffusion_steps,
+                            inference_cfg_rate=inference_cfg_rate,
+                        )
+                    vc_target = vc_target.float()
+                else:
+                    vc_target = self.s2mel.models['cfm'].inference(
+                        cat_condition,
+                        torch.LongTensor([cat_condition.size(1)]).to(cond.device),
+                        ref_mel, style, None, diffusion_steps,
+                        inference_cfg_rate=inference_cfg_rate,
+                    )
                 vc_target = vc_target[:, :, ref_mel.size(-1):]
                 s2mel_dt = time.perf_counter() - m_start_time
 
