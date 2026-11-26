@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from functools import lru_cache
 import os
 import traceback
 import re
@@ -59,6 +60,19 @@ class TextNormalizer:
             **self.char_rep_map,
         }
         self._base_cleanup_pattern = re.compile("|".join(re.escape(p) for p in self.char_rep_map.keys()))
+        self._zh_cleanup_pattern = re.compile("|".join(re.escape(p) for p in self.zh_char_rep_map.keys()))
+        self._norm_cache = {}
+        self._norm_cache_max = 512
+
+    # Characters/tokens where WeTextProcessing's English FST actually rewrites text.
+    # Pure alphabetic English prose without digits/symbols/abbreviations passes through
+    # en_normalizer.normalize() unchanged; skipping the ~22 ms OpenFST call saves 40-100 ms/req.
+    _EN_NEEDS_FST_RE = re.compile(
+        r"[\d$£€¥¢%@#&/+*=<>_\\|:°™®©§¶]"
+        r"|\b(?:mr|mrs|ms|dr|st|jr|sr|prof|etc|vs|inc|ltd|no|vol|fig|ft|lb|lbs|oz|kg|km|cm|mm|mg|ml|hr|hrs|ave|blvd|rd|dept|gov|co|corp|bros|rev|hon|gen|col|lt|sgt|capt|pres|sen|rep|eg|ie|am|pm)\."
+        r"|\b[A-Za-z]\.",
+        re.IGNORECASE,
+    )
 
     def match_email(self, email):
         # 正则表达式匹配邮箱格式：数字英文@数字英文.英文
@@ -153,10 +167,18 @@ class TextNormalizer:
         if text is None:
             return ""
         lang = language.strip().lower() if language else None
+        cache_key = (text, lang)
+        cached = self._norm_cache.get(cache_key)
+        if cached is not None:
+            return cached
         if lang == "ja":
-            return self.normalize_japanese(text)
+            res = self.normalize_japanese(text)
+            self._put_norm_cache(cache_key, res)
+            return res
         if lang is not None and lang not in ("zh", "en"):
-            return self._basic_cleanup(text)
+            res = self._basic_cleanup(text)
+            self._put_norm_cache(cache_key, res)
+            return res
         if not self.zh_normalizer or not self.en_normalizer:
             print("Error, text normalizer is not initialized !!!")
             return ""
@@ -174,18 +196,25 @@ class TextNormalizer:
             result = self.restore_names(result, original_name_list)
             # 恢复拼音声调
             result = self.restore_pinyin_tones(result, pinyin_list)
-            pattern = re.compile("|".join(re.escape(p) for p in self.zh_char_rep_map.keys()))
-            result = pattern.sub(lambda x: self.zh_char_rep_map[x.group()], result)
+            result = self._zh_cleanup_pattern.sub(lambda x: self.zh_char_rep_map[x.group()], result)
         else:
             try:
                 text = re.sub(TextNormalizer.ENGLISH_CONTRACTION_PATTERN, r"\1 is", text, flags=re.IGNORECASE)
-                result = self.en_normalizer.normalize(text)
+                if self._EN_NEEDS_FST_RE.search(text):
+                    result = self.en_normalizer.normalize(text)
+                else:
+                    result = text
             except Exception:
                 result = text
                 print(traceback.format_exc())
-            pattern = re.compile("|".join(re.escape(p) for p in self.char_rep_map.keys()))
-            result = pattern.sub(lambda x: self.char_rep_map[x.group()], result)
+            result = self._base_cleanup_pattern.sub(lambda x: self.char_rep_map[x.group()], result)
+        self._put_norm_cache(cache_key, result)
         return result
+
+    def _put_norm_cache(self, key, val):
+        if len(self._norm_cache) >= self._norm_cache_max:
+            self._norm_cache.clear()
+        self._norm_cache[key] = val
 
     def correct_pinyin(self, pinyin: str):
         """
@@ -540,8 +569,11 @@ class TextTokenizer:
                 pieces.append((self.decode(self.convert_tokens_to_ids(frag)).strip(), frag))
 
         for sent in self._split_original_sentences(text):
-            if len(self.tokenize(sent)) <= max_tokens_per_sentence:
-                add(sent)
+            sent_tokens = self.tokenize(sent)
+            if not sent_tokens:
+                continue
+            if len(sent_tokens) <= max_tokens_per_sentence:
+                pieces.append((sent, sent_tokens))
             else:
                 for part in self._COMMA_SPLIT_RE.split(sent):
                     part = part.strip()

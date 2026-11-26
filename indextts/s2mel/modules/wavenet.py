@@ -135,35 +135,35 @@ class WN(torch.nn.Module):
             res_skip_layer = conv1d_type(hidden_channels, res_skip_channels, 1, norm='weight_norm', causal=causal)
             self.res_skip_layers.append(res_skip_layer)
 
-    def forward(self, x, x_mask, g=None, **kwargs):
+    def forward(self, x, x_mask=None, g=None, g_precomputed=None, **kwargs):
         output = torch.zeros_like(x)
-        n_channels_tensor = torch.IntTensor([self.hidden_channels])
+        n_ch = self.hidden_channels
 
-        if g is not None:
+        if g_precomputed is not None:
+            g = g_precomputed
+        elif g is not None:
             g = self.cond_layer(g)
 
         for i in range(self.n_layers):
             x_in = self.in_layers[i](x)
             if g is not None:
-                cond_offset = i * 2 * self.hidden_channels
-                g_l = g[:, cond_offset:cond_offset + 2 * self.hidden_channels, :]
+                cond_offset = i * 2 * n_ch
+                g_l = g[:, cond_offset:cond_offset + 2 * n_ch, :]
+                in_act = x_in + g_l
             else:
-                g_l = torch.zeros_like(x_in)
+                in_act = x_in
 
-            acts = commons.fused_add_tanh_sigmoid_multiply(
-                x_in,
-                g_l,
-                n_channels_tensor)
+            acts = torch.tanh(in_act[:, :n_ch, :]) * torch.sigmoid(in_act[:, n_ch:, :])
             acts = self.drop(acts)
 
             res_skip_acts = self.res_skip_layers[i](acts)
             if i < self.n_layers - 1:
-                res_acts = res_skip_acts[:, :self.hidden_channels, :]
-                x = (x + res_acts) * x_mask
-                output = output + res_skip_acts[:, self.hidden_channels:, :]
+                res_acts = res_skip_acts[:, :n_ch, :]
+                x = (x + res_acts) * x_mask if x_mask is not None else (x + res_acts)
+                output = output + res_skip_acts[:, n_ch:, :]
             else:
                 output = output + res_skip_acts
-        return output * x_mask
+        return output * x_mask if x_mask is not None else output
 
     def remove_weight_norm(self):
         if self.gin_channels != 0:

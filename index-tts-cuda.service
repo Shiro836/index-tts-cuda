@@ -1,0 +1,22 @@
+[Unit]
+Description=index-tts multilingual API server (custom sm_89 CUDA GPT-2 + TF32 s2mel, port 5113)
+Wants=network-online.target
+After=network-online.target
+After=llm_text.service llm_text3.service style.service
+Conflicts=index-tts-multilingual.service index-tts-updated.service index-tts.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=forsen
+WorkingDirectory=/home/forsen/repos/index-tts-cuda
+Environment="PYTHONUNBUFFERED=1"
+ExecStartPre=/home/forsen/repos/index-tts-cuda/wait_for_vram.sh 11000 300 GPU-fdfb5a67-39d2-1ca2-149e-d78c2d5dd346
+ExecStart=/bin/bash /home/forsen/repos/index-tts-cuda/run_multilingual.sh
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=300
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

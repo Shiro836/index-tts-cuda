@@ -2,6 +2,7 @@ import asyncio
 import os
 import random
 import re
+import threading
 import time
 import traceback
 from collections import OrderedDict
@@ -255,6 +256,18 @@ class IndexTTS2:
             self.use_cuda_kernel = False
             logger.info(">> Be patient, it may take a while to run in CPU mode.")
 
+        if os.environ.get("TTS_TF32") == "1" and torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.set_float32_matmul_precision("high")
+            logger.info(">> TF32 enabled for FP32 matmul/cuDNN (TTS_TF32=1; s2mel/BigVGAN remain FP32)")
+
+        self._use_streams = os.environ.get("TTS_STREAMS") == "1" and torch.cuda.is_available()
+        self._thread_local = threading.local()
+        # Serialize concurrent s2mel+BigVGAN tails so sentence 0 gets full SM throughput for TTFA
+        # while still overlapping freely with CudaGptEngine decode and CPU code_aligner.
+        self._s2mel_lock = threading.Lock()
+
         if offload_device:
             self.gpt_device = self.device
             self.device = offload_device
@@ -301,41 +314,56 @@ class IndexTTS2:
         # touches CUDA: vLLM's _maybe_force_spawn falls back to the (much slower)
         # spawn start method once the parent holds a CUDA context, and QwenEmotion
         # must not be mutating CUDA_VISIBLE_DEVICES while they boot.
+        self.gpt_engine_mode = os.environ.get("GPT_ENGINE", "vllm").strip().lower()
+        if self.gpt_engine_mode not in ("vllm", "cuda"):
+            raise ValueError(f"Unsupported GPT_ENGINE={self.gpt_engine_mode!r}; expected 'vllm' or 'cuda'")
+        self.cuda_gpt_engine = None
+
         self.single_engine_lora = bool(single_engine_lora)
         self.lora_peft_dir = lora_peft_dir
-        if self.single_engine_lora and not self.dual_mode:
-            raise ValueError("single_engine_lora requires dual (routed) mode")
-        if self.single_engine_lora and not self.lora_peft_dir:
-            # Without the adapter the 16 routed languages would silently run pure
-            # base weights — a broken product that boots fine. Fail loudly instead.
-            raise ValueError("single_engine_lora requires lora_peft_dir")
-        if self.dual_mode and self.single_engine_lora:
-            # Production config (user decision, STATE.md §15-J measurements): ONE
-            # engine on the pristine base weights, LoRA-enabled. Adapter-view
-            # requests carry a LoRARequest; base-view requests carry none and see
-            # the untouched base weights (measured: +57 ms/clip EN, +658 ms/clip
-            # adapter langs at bs=1, saves 1.7 GiB + unifies the KV pool).
-            # The torch-side views stay two independent UnifiedVoice objects.
-            base_engine = _build_gpt_engine(
-                base_model_dir, gpu_memory_utilization,
-                (base_kv_cache_memory_bytes or 0) + (adapter_kv_cache_memory_bytes or 0)
-                or kv_cache_memory_bytes,
-                enable_lora=True,
+        if self.gpt_engine_mode == "cuda":
+            from indextts.gpt.cuda_gpt_engine import CudaGptEngine
+            max_batch = int(os.environ.get("GPT_CUDA_MAX_BATCH", "4"))
+            model_dirs = {0: base_model_dir, 1: adapter_model_dir} if self.dual_mode else {0: primary_dir}
+            self.cuda_gpt_engine = CudaGptEngine(
+                model_dirs, max_batch=max_batch, max_seq_len=1818, device=self.gpt_device
             )
-            adapter_engine = base_engine
-        elif self.dual_mode:
-            adapter_engine = _build_gpt_engine(
-                adapter_model_dir, gpu_memory_utilization,
-                adapter_kv_cache_memory_bytes or kv_cache_memory_bytes,
-            )
-            base_engine = _build_gpt_engine(
-                base_model_dir, gpu_memory_utilization,
-                base_kv_cache_memory_bytes or kv_cache_memory_bytes,
-                disable_log_stats=True,
-            )
-        else:
-            adapter_engine = _build_gpt_engine(primary_dir, gpu_memory_utilization, kv_cache_memory_bytes)
+            adapter_engine = None
             base_engine = None
+        else:
+            if self.single_engine_lora and not self.dual_mode:
+                raise ValueError("single_engine_lora requires dual (routed) mode")
+            if self.single_engine_lora and not self.lora_peft_dir:
+                # Without the adapter the 16 routed languages would silently run pure
+                # base weights — a broken product that boots fine. Fail loudly instead.
+                raise ValueError("single_engine_lora requires lora_peft_dir")
+            if self.dual_mode and self.single_engine_lora:
+                # Production config (user decision, STATE.md §15-J measurements): ONE
+                # engine on the pristine base weights, LoRA-enabled. Adapter-view
+                # requests carry a LoRARequest; base-view requests carry none and see
+                # the untouched base weights (measured: +57 ms/clip EN, +658 ms/clip
+                # adapter langs at bs=1, saves 1.7 GiB + unifies the KV pool).
+                # The torch-side views stay two independent UnifiedVoice objects.
+                base_engine = _build_gpt_engine(
+                    base_model_dir, gpu_memory_utilization,
+                    (base_kv_cache_memory_bytes or 0) + (adapter_kv_cache_memory_bytes or 0)
+                    or kv_cache_memory_bytes,
+                    enable_lora=True,
+                )
+                adapter_engine = base_engine
+            elif self.dual_mode:
+                adapter_engine = _build_gpt_engine(
+                    adapter_model_dir, gpu_memory_utilization,
+                    adapter_kv_cache_memory_bytes or kv_cache_memory_bytes,
+                )
+                base_engine = _build_gpt_engine(
+                    base_model_dir, gpu_memory_utilization,
+                    base_kv_cache_memory_bytes or kv_cache_memory_bytes,
+                    disable_log_stats=True,
+                )
+            else:
+                adapter_engine = _build_gpt_engine(primary_dir, gpu_memory_utilization, kv_cache_memory_bytes)
+                base_engine = None
 
         self.qwen_emo = None
         self.qwen_emo_mode = qwen_emo_mode
@@ -356,6 +384,12 @@ class IndexTTS2:
             "adapter" if self.dual_mode else "single", primary_dir,
             vllm_engine=adapter_engine, cfg=self.cfg, normalizer=self.normalizer,
         )
+        if self.cuda_gpt_engine is not None:
+            # Drop the duplicate 1.9 GiB FP32 PyTorch GPT-2 body before .to(device);
+            # CudaGptEngine serves both inference_speech and forward().
+            primary_view.model.gpt = torch.nn.Identity()
+            primary_view.model.cuda_engine = self.cuda_gpt_engine
+            primary_view.model.cuda_model_id = 1 if self.dual_mode else 0
         self.gpt = primary_view.model.to(self.gpt_device)
         self.gpt_path = os.path.join(primary_dir, self.cfg.gpt_checkpoint)
         if self.is_fp16:
@@ -369,6 +403,10 @@ class IndexTTS2:
                 "base", base_model_dir, vllm_engine=base_engine,
                 normalizer=self.normalizer, share_from=primary_view,
             )
+            if self.cuda_gpt_engine is not None:
+                base_view.model.gpt = torch.nn.Identity()
+                base_view.model.cuda_engine = self.cuda_gpt_engine
+                base_view.model.cuda_model_id = 0
             # only the children the base checkpoint actually owns need a device copy;
             # the rest ARE the adapter view's tensors, already moved and halved above,
             # and re-running the fp16 conversion over them would register the LayerNorm
@@ -380,7 +418,7 @@ class IndexTTS2:
             base_view.model.eval()
             self.views["base"] = base_view
 
-        if self.single_engine_lora:
+        if self.single_engine_lora and self.cuda_gpt_engine is None:
             from vllm.lora.request import LoRARequest
             primary_view.model.lora_request = LoRARequest(
                 "adapter", 1, str(self.lora_peft_dir))
@@ -448,6 +486,9 @@ class IndexTTS2:
         # real upper bound is prompt_condition + 1.72 * codes ≈ 2.4k positions at the
         # 120-token sentence cap; 8192 wasted a few hundred MB of preallocated cache
         self.s2mel.models['cfm'].estimator.setup_caches(max_batch_size=1, max_seq_length=4096)
+        if os.environ.get("S2MEL_OPT") == "1":
+            removed = self.s2mel.models['cfm'].enable_fast_path()
+            logger.info(f">> s2mel fast path enabled (S2MEL_OPT=1, removed {removed} weight_norms)")
         if os.environ.get("S2MEL_COMPILE") == "1":
             self.s2mel.models['cfm'].enable_torch_compile()
             logger.info(">> s2mel estimator compiled (S2MEL_COMPILE=1)")
@@ -538,26 +579,46 @@ class IndexTTS2:
 
     def engine_status(self):
         """Per-engine health, for /health."""
-        engines = {name: view.model.llm for name, view in self.views.items()}
-        if self.qwen_emo is not None:
-            engines["qwen_emo"] = self.qwen_emo.model
         status = {}
-        for name, engine in engines.items():
-            try:
-                status[name] = {"running": bool(engine.is_running), "errored": bool(engine.errored)}
-            except Exception as ex:
-                status[name] = {"running": None, "errored": None, "error": str(ex)}
-            view = self.views.get(name)
-            if view is not None:
+        if self.cuda_gpt_engine is not None:
+            running = self.cuda_gpt_engine._handle is not None
+            vram_mib = round(self.cuda_gpt_engine.vram_bytes / (1024 * 1024), 1)
+            for name, view in self.views.items():
+                status[name] = {
+                    "running": running,
+                    "errored": False,
+                    "backend": "cuda",
+                    "vram_mib": vram_mib,
+                    "model_dir": view.model_dir,
+                }
+        else:
+            for name, view in self.views.items():
+                engine = view.model.llm
+                try:
+                    status[name] = {"running": bool(engine.is_running), "errored": bool(engine.errored)}
+                except Exception as ex:
+                    status[name] = {"running": None, "errored": None, "error": str(ex)}
                 status[name]["model_dir"] = view.model_dir
+        if self.qwen_emo is not None:
+            engine = self.qwen_emo.model
+            try:
+                status["qwen_emo"] = {"running": bool(engine.is_running), "errored": bool(engine.errored)}
+            except Exception as ex:
+                status["qwen_emo"] = {"running": None, "errored": None, "error": str(ex)}
         return {
             "mode": "dual" if self.dual_mode else "single",
+            "gpt_engine": self.gpt_engine_mode,
             "engines": status,
         }
 
     def shutdown(self):
-        """Stop every EngineCore subprocess. Nothing else calls this — without it the
-        children survive the parent and keep holding their KV cache."""
+        """Stop every EngineCore subprocess or in-process CUDA GPT engine."""
+        if self.cuda_gpt_engine is not None:
+            try:
+                self.cuda_gpt_engine.shutdown()
+                logger.info(">> shut down CudaGptEngine")
+            except Exception:
+                logger.exception(">> failed to shut down CudaGptEngine")
         engines = [(name, view.model.llm) for name, view in self.views.items()]
         if self.qwen_emo is not None:
             engines.append(("qwen_emo", self.qwen_emo.model))
@@ -644,10 +705,11 @@ class IndexTTS2:
                                                                  n_quantizers=3,
                                                                  f0=None)[0]
 
-        # GPT conditioning latent (was recomputed inside inference_speech per sentence).
+        # GPT conditioning latent + base emotion vector (pure function of reference wav).
         # Length semantics (shape[-1]) intentionally match the original call sites.
         cond_lengths_gpt = torch.tensor([spk_cond_emb.shape[-1]], device=self.gpt_device)
         cond_latent = self.gpt.get_conditioning(spk_cond_emb_gpt.transpose(1, 2), cond_lengths_gpt)
+        emovec = self.gpt.get_emovec(spk_cond_emb_gpt, cond_lengths_gpt)
 
         return {
             "spk_cond_emb": spk_cond_emb,
@@ -656,6 +718,7 @@ class IndexTTS2:
             "ref_mel": ref_mel,
             "style": style,
             "cond_latent": cond_latent,
+            "emovec": emovec,
         }
 
     async def _get_ref(self, audio_path):
@@ -722,6 +785,15 @@ class IndexTTS2:
         return [{"word": w["word"], "start": round(offset_sec + w["start"], 3),
                  "end": round(offset_sec + w["end"], 3), "aligned": w["aligned"]} for w in words]
 
+    def _get_worker_stream(self):
+        if not self._use_streams:
+            return None
+        stream = getattr(self._thread_local, "cuda_stream", None)
+        if stream is None:
+            stream = torch.cuda.Stream(device=self.device)
+            self._thread_local.cuda_stream = stream
+        return stream
+
     def _sentence_to_wav(self, gpt_model, codes, text_tokens, speech_conditioning_latent,
                          spk_cond_emb, emo_cond_emb_gpt, cond_lengths, emo_cond_lengths,
                          emovec, prompt_condition, ref_mel, style, verbose=False):
@@ -732,16 +804,18 @@ class IndexTTS2:
         changed — so an en/zh sentence must go through the base view here or its
         s2mel latent is adapter-weighted (docs/ROUTING.md §1).
 
-        Runs on the mel executor — the block has no await points, so inline it
-        would pin the event loop for the whole pass. All inputs and outputs are
-        per-sentence locals and the shared modules are pure forwards, so
-        concurrent invocations from different requests are safe; they share the
-        default CUDA stream, so GPU kernels serialize while the loop stays free
-        (the GIL is released during CUDA ops).
-
         Returns (wav_cpu, gpt_forward_dt, s2mel_dt, bigvgan_dt).
         """
-        with torch.no_grad():
+        worker_stream = self._get_worker_stream()
+        if worker_stream is not None:
+            # Ensure producer tensors created on the default stream are visible
+            worker_stream.wait_stream(torch.cuda.default_stream(self.device))
+            ctx = torch.cuda.stream(worker_stream)
+        else:
+            from contextlib import nullcontext
+            ctx = nullcontext()
+
+        with torch.no_grad(), ctx:
             code_lens = []
             for code in codes:
                 if self.stop_mel_token not in code:
@@ -777,7 +851,7 @@ class IndexTTS2:
             latent = latent.to(self.device)
             codes = codes.to(self.device)
 
-            with torch.amp.autocast(self.device.split(":")[0] if isinstance(self.device, str) else self.device.type, enabled=self.dtype is not None, dtype=self.dtype):
+            with self._s2mel_lock, torch.amp.autocast(self.device.split(":")[0] if isinstance(self.device, str) else self.device.type, enabled=self.dtype is not None, dtype=self.dtype):
                 m_start_time = time.perf_counter()
                 diffusion_steps = int(os.environ.get("S2MEL_STEPS", "25"))
                 inference_cfg_rate = 0.7
@@ -805,10 +879,10 @@ class IndexTTS2:
                 bigvgan_dt = time.perf_counter() - m_start_time
                 wav = wav.squeeze(1)
 
-            wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
-            if verbose:
-                print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
-            wav = wav.cpu()
+                wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
+                if verbose:
+                    print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
+                wav = wav.cpu()
 
         return wav, gpt_forward_dt, s2mel_dt, bigvgan_dt
 
@@ -1053,21 +1127,17 @@ class IndexTTS2:
         bigvgan_time = 0
 
         # request-invariant conditioning, hoisted out of the sentence loop
-        # (the old code recomputed it per sentence with identical inputs)
+        # (reuses cached per-reference emovec instead of running Conformer+Perceiver twice/req)
         cond_lengths = torch.tensor([spk_cond_emb.shape[-1]], device=self.gpt_device)
         emo_cond_lengths = torch.tensor([emo_cond_emb.shape[-1]], device=self.gpt_device)
         with torch.no_grad():
-            emovec = self.gpt.merge_emovec(
-                spk_cond_emb_gpt,
-                emo_cond_emb_gpt,
-                cond_lengths,
-                emo_cond_lengths,
-                alpha=emo_alpha
-            )
+            if emo_ref is spk_ref:
+                emovec = spk_ref["emovec"]
+            else:
+                emovec = spk_ref["emovec"] + emo_alpha * (emo_ref["emovec"] - spk_ref["emovec"])
 
             if emo_vector is not None:
                 emovec = emovec_mat.to(self.gpt_device) + (1 - torch.sum(weight_vector.to(self.gpt_device))) * emovec
-                # emovec = emovec_mat
 
         # launch every sentence's GPT decode at once — sentences are conditioned
         # only on the reference audio, not on each other, and vLLM batches the
@@ -1097,48 +1167,68 @@ class IndexTTS2:
         sil_tensor = torch.zeros(1, sil_samples)
         cursor = 0
         total_audio_samples = 0
+        loop = asyncio.get_running_loop()
+
+        async def _finish_sentence(plan, text_tokens, gen_task):
+            m_start_time = time.perf_counter()
+            codes, speech_conditioning_latent = await gen_task
+            gen_dt = time.perf_counter() - m_start_time
+
+            align_fut = None
+            codes_np = None
+            if self.code_aligner is not None:
+                codes_np = self._trim_codes(codes)
+                align_fut = loop.run_in_executor(
+                    self._align_executor, self.code_aligner.align, codes_np, plan["text"])
+
+            wav, fwd_dt, mel_dt, voc_dt = await loop.run_in_executor(
+                self._mel_executor,
+                self._sentence_to_wav,
+                plan["view"].model,
+                codes, text_tokens, speech_conditioning_latent,
+                spk_cond_emb, emo_cond_emb_gpt, cond_lengths, emo_cond_lengths,
+                emovec, prompt_condition, ref_mel, style, verbose,
+            )
+            raw_words = None
+            if align_fut is not None:
+                try:
+                    raw_words = await align_fut
+                except Exception as ex:  # never fail synthesis over timings
+                    logger.warning(f">> code aligner failed on {plan['text']!r}: {ex}")
+            return wav, raw_words, codes_np, gen_dt, fwd_dt, mel_dt, voc_dt
+
+        # Pipeline sentence tails concurrently while still yielding strictly in sentence order
+        sent_tasks = [
+            asyncio.create_task(_finish_sentence(plan, text_tokens, gen_task))
+            for plan, text_tokens, gen_task in zip(sent_plans, sent_text_tokens, gen_tasks)
+        ]
 
         try:
-            for sent_idx, (plan, text_tokens, gen_task) in enumerate(zip(sent_plans, sent_text_tokens, gen_tasks)):
-                m_start_time = time.perf_counter()
-                codes, speech_conditioning_latent = await gen_task
-                gpt_gen_time += time.perf_counter() - m_start_time
-
-                align_fut = None
-                codes_np = None
-                if self.code_aligner is not None:
-                    codes_np = self._trim_codes(codes)
-                    align_fut = asyncio.get_running_loop().run_in_executor(
-                        self._align_executor, self._align_codes, codes_np, plan["text"], cursor / sampling_rate)
-
-                wav, fwd_dt, mel_dt, voc_dt = await asyncio.get_running_loop().run_in_executor(
-                    self._mel_executor,
-                    self._sentence_to_wav,
-                    plan["view"].model,
-                    codes, text_tokens, speech_conditioning_latent,
-                    spk_cond_emb, emo_cond_emb_gpt, cond_lengths, emo_cond_lengths,
-                    emovec, prompt_condition, ref_mel, style, verbose,
-                )
+            for sent_idx, (plan, sent_task) in enumerate(zip(sent_plans, sent_tasks)):
+                wav, raw_words, codes_np, gen_dt, fwd_dt, mel_dt, voc_dt = await sent_task
+                gpt_gen_time += gen_dt
                 gpt_forward_time += fwd_dt
                 s2mel_time += mel_dt
                 bigvgan_time += voc_dt
 
                 n = wav.shape[-1]
+                offset_sec = cursor / sampling_rate
                 segment = {
                     "text": plan["text"],
                     "language": plan["language"],
-                    "start": round(cursor / sampling_rate, 3),
+                    "start": round(offset_sec, 3),
                     "end": round((cursor + n) / sampling_rate, 3),
                 }
-                if align_fut is not None:
-                    try:
-                        segment["words"] = await align_fut
-                    except Exception as ex:  # never fail synthesis over timings
-                        logger.warning(f">> code aligner failed on {plan['text']!r}: {ex}")
+                if raw_words is not None:
+                    segment["words"] = [
+                        {"word": w["word"], "start": round(offset_sec + w["start"], 3),
+                         "end": round(offset_sec + w["end"], 3), "aligned": w["aligned"]}
+                        for w in raw_words
+                    ]
                     # private: lets infer() re-align the whole text when the sentence split
                     # broke a whitespace word; stripped before any response is built
                     segment["_codes"] = codes_np
-                is_last = sent_idx == len(gen_tasks) - 1
+                is_last = sent_idx == len(sent_tasks) - 1
                 chunk = wav if (is_last or sil_samples == 0) else torch.cat([wav, sil_tensor], dim=1)
                 cursor += chunk.shape[-1]
                 total_audio_samples += chunk.shape[-1]
@@ -1147,6 +1237,8 @@ class IndexTTS2:
         except BaseException:
             # also covers GeneratorExit when the consumer disconnects mid-stream:
             # abort the decodes still running in vLLM
+            for task in sent_tasks:
+                task.cancel()
             for task in gen_tasks:
                 task.cancel()
             raise

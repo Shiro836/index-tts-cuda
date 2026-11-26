@@ -17,3 +17,8 @@ output.wav
 
 logs/
 ship_artifacts/
+bench_out/
+csrc/gpt_engine/*.so
+csrc/gpt_engine/*.o
+indextts/s2mel/modules/bigvgan/alias_free_activation/cuda/build/
+*.pyc

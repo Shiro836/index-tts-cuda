@@ -1,4 +1,5 @@
 from abc import ABC
+import os
 
 import torch
 import torch.nn.functional as F
@@ -7,6 +8,20 @@ from indextts.s2mel.modules.diffusion_transformer import DiT
 from indextts.s2mel.modules.commons import sequence_mask
 
 from tqdm import tqdm
+
+
+class _FastDiTStepModule(torch.nn.Module):
+    """Thin nn.Module wrapper so torch.compile targets forward_step_fast cleanly."""
+
+    def __init__(self, estimator: DiT):
+        super().__init__()
+        self.estimator = estimator
+
+    def forward(self, x_single, const_in_proj, wn_g_step, final_shift, final_scale, adaln_wb):
+        return self.estimator.forward_step_fast(
+            x_single, const_in_proj, wn_g_step, final_shift, final_scale, adaln_wb
+        )
+
 
 class BASECFM(torch.nn.Module, ABC):
     def __init__(
@@ -17,6 +32,8 @@ class BASECFM(torch.nn.Module, ABC):
         self.sigma_min = 1e-6
 
         self.estimator = None
+        self._fast_path = False
+        self._fast_step = None
 
         self.in_channels = args.DiT.in_channels
 
@@ -82,6 +99,42 @@ class BASECFM(torch.nn.Module, ABC):
         x[..., :prompt_len] = 0
         if self.zero_prompt_speech_token:
             mu[..., :prompt_len] = 0
+
+        if (
+            self._fast_path
+            and inference_cfg_rate > 0
+            and x.size(0) == 1
+            and self.estimator.can_use_fast_step()
+        ):
+            n_steps = len(t_span) - 1
+            dt = 1.0 / n_steps
+            stacked_prompt_x = torch.cat([prompt_x, torch.zeros_like(prompt_x)], dim=0)
+            stacked_style = torch.cat([style, torch.zeros_like(style)], dim=0)
+            stacked_mu = torch.cat([mu, torch.zeros_like(mu)], dim=0)
+            const_in_proj = self.estimator.precompute_const_in_proj(
+                stacked_prompt_x, stacked_style, stacked_mu
+            )
+            wn_g_all, final_shift_all, final_scale_all, adaln_all = (
+                self.estimator.get_cached_time_params(n_steps, x.device, x.dtype)
+            )
+            step_fn = self._fast_step if self._fast_step is not None else self.estimator.forward_step_fast
+            cfg_pos = 1.0 + inference_cfg_rate
+            cfg_neg = inference_cfg_rate
+            for s in range(n_steps):
+                stacked_dphi_dt = step_fn(
+                    x,
+                    const_in_proj,
+                    wn_g_all[s:s + 1],
+                    final_shift_all[s:s + 1],
+                    final_scale_all[s:s + 1],
+                    adaln_all[s],
+                )
+                dphi_dt, cfg_dphi_dt = stacked_dphi_dt.chunk(2, dim=0)
+                dphi_dt = cfg_pos * dphi_dt - cfg_neg * cfg_dphi_dt
+                x = x + dt * dphi_dt
+                x[:, :, :prompt_len] = 0
+            return x
+
         for step in tqdm(range(1, len(t_span))):
             dt = t_span[step] - t_span[step - 1]
             if inference_cfg_rate > 0:
@@ -114,10 +167,20 @@ class BASECFM(torch.nn.Module, ABC):
 
         return sol[-1]
 
+    def enable_fast_path(self):
+        """Remove weight_norm and enable hoisted-invariant unmasked Euler fast path (S2MEL_OPT=1)."""
+        removed = self.estimator.remove_weight_norm()
+        self._fast_path = True
+        self._fast_step = _FastDiTStepModule(self.estimator)
+        return removed
+
     def enable_torch_compile(self):
         """Compile the DiT estimator (upstream index-tts recipe). Gated by
         S2MEL_COMPILE=1 at load time."""
-        self.estimator = torch.compile(self.estimator, fullgraph=True, dynamic=True)
+        if self._fast_path and self._fast_step is not None:
+            self._fast_step = torch.compile(self._fast_step, fullgraph=True, dynamic=True)
+        else:
+            self.estimator = torch.compile(self.estimator, fullgraph=True, dynamic=True)
 
     def forward(self, x1, x_lens, prompt_lens, mu, style):
         """Computes diffusion loss

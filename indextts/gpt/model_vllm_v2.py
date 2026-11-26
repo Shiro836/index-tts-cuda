@@ -150,6 +150,9 @@ class UnifiedVoice(nn.Module):
         # serving its own gpt/ dir (docs/ROUTING.md §1). vllm_model may be None for a
         # torch-only view (tests, offline latent forwards).
         self.llm: AsyncLLM = vllm_model
+        # Optional in-process sm_89 CUDA GPT-2 engine (GPT_ENGINE=cuda)
+        self.cuda_engine = None
+        self.cuda_model_id = 0
         # EXPERIMENTAL (STATE.md §15-J): when one LoRA-enabled engine serves both
         # views, the adapter view sets this to a vllm.lora.request.LoRARequest and
         # the base view leaves it None (its tokens then run on pristine base
@@ -247,14 +250,31 @@ class UnifiedVoice(nn.Module):
         mel_start_emb = mel_start_emb + self.mel_pos_embedding(mel_start_emb)
         inputs_embeds = torch.cat([emb, mel_start_emb], dim=1)
 
+        request_id = uuid.uuid4().hex
+        gpt_stt = time.time()
+        if self.cuda_engine is not None:
+            token_ids, _ = await self.cuda_engine.generate_async(
+                self.cuda_model_id,
+                inputs_embeds,
+                max_new_tokens=int(self.sampling_params.max_tokens),
+                temperature=float(self.sampling_params.temperature),
+                top_p=float(self.sampling_params.top_p),
+                top_k=int(self.sampling_params.top_k),
+                repetition_penalty=float(self.sampling_params.repetition_penalty),
+                stop_token_id=int(self.stop_mel_token),
+            )
+            gen_len = len(token_ids)
+            gen_time = time.time() - gpt_stt
+            logger.info(f"[{request_id}] [gen time: {gen_time:.4f}] [gen len: {gen_len}] [tok/s: {gen_len / max(gen_time, 1e-6):.1f}]")
+            codes = token_ids[:-2]
+            codes = torch.tensor(codes, device=text_inputs.device, dtype=torch.long).unsqueeze(0)
+            return codes, speech_conditioning_latent
+
         fake_inputs = PLACEHOLDER_TOKEN * 1  # [PLACEHOLDER_TOKEN_ID]
         multi_modal_data = {"audio": {"audio_embeds": [inputs_embeds.squeeze(0).cpu()]}}
         tokens_prompt = TokensPrompt(prompt=fake_inputs, multi_modal_data=multi_modal_data)
-        # tokens_prompt = TokensPrompt(prompt_token_ids=fake_inputs, multi_modal_data=multi_modal_data)
-        request_id = uuid.uuid4().hex
         output_generator = self.llm.generate(tokens_prompt, sampling_params=self.sampling_params, request_id=request_id,
                                              lora_request=self.lora_request)
-        gpt_stt = time.time()
         output = None
         async for output in output_generator:
             pass
@@ -296,10 +316,14 @@ class UnifiedVoice(nn.Module):
         mel_emb = mel_emb + self.mel_pos_embedding(mel_codes)
 
         emb = torch.cat([conds, text_emb, mel_emb], dim=1)
-        gpt_out = self.gpt(inputs_embeds=emb, return_dict=True)
         offset = conds.shape[1]
-        enc = gpt_out.last_hidden_state[:, offset:]
-        enc = self.final_norm(enc)
+        if self.cuda_engine is not None:
+            # forward_latents runs 24 GPT-2 layers + ln_f + final_norm in FP16->FP32
+            enc = self.cuda_engine.forward_latents(self.cuda_model_id, emb)[:, offset:]
+        else:
+            gpt_out = self.gpt(inputs_embeds=emb, return_dict=True)
+            enc = gpt_out.last_hidden_state[:, offset:]
+            enc = self.final_norm(enc)
         
         return enc[:, -mel_emb.shape[1]:][:, :-2]
 

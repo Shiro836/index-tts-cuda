@@ -4,12 +4,26 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 from dataclasses import dataclass
+import os
 from typing import Optional
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
+
+_TF32_FA_OP = None
+
+
+def _get_tf32_fa_op():
+    global _TF32_FA_OP
+    if _TF32_FA_OP is None:
+        try:
+            import indextts.gpt.cuda_gpt_engine  # registers indextts::tf32_sdpa_d64
+            _TF32_FA_OP = torch.ops.indextts.tf32_sdpa_d64
+        except Exception:
+            _TF32_FA_OP = False
+    return _TF32_FA_OP if _TF32_FA_OP else None
 
 
 def find_multiple(n: int, k: int) -> int:
@@ -27,7 +41,10 @@ class AdaptiveLayerNorm(nn.Module):
         self.d_model = d_model
         self.eps = self.norm.eps
 
-    def forward(self, input: Tensor, embedding: Tensor = None) -> Tensor:
+    def forward(self, input: Tensor, embedding: Tensor = None, precomputed_wb: Optional[Tensor] = None) -> Tensor:
+        if precomputed_wb is not None:
+            weight, bias = precomputed_wb.split(self.d_model, dim=-1)
+            return weight * self.norm(input) + bias
         if embedding is None:
             return self.norm(input)
         weight, bias = torch.split(
@@ -159,15 +176,17 @@ class Transformer(nn.Module):
 
     def forward(self,
                 x: Tensor,
-                c: Tensor,
+                c: Optional[Tensor],
                 input_pos: Optional[Tensor] = None,
                 mask: Optional[Tensor] = None,
                 context: Optional[Tensor] = None,
                 context_input_pos: Optional[Tensor] = None,
                 cross_attention_mask: Optional[Tensor] = None,
+                unmasked: bool = False,
+                adaln_wb: Optional[Tensor] = None,
                 ) -> Tensor:
         assert self.freqs_cis is not None, "Caches must be initialized first"
-        if mask is None: # in case of non-causal model
+        if mask is None and not unmasked: # in case of non-causal model
             if not self.training and self.use_kv_cache:
                 mask = self.causal_mask[None, None, input_pos]
             else:
@@ -184,10 +203,13 @@ class Transformer(nn.Module):
                 skip_in_x = skip_in_x_list.pop(-1)
             else:
                 skip_in_x = None
-            x = layer(x, c, input_pos, freqs_cis, mask, context, context_freqs_cis, cross_attention_mask, skip_in_x)
+            attn_wb = adaln_wb[2 * i] if adaln_wb is not None else None
+            ffn_wb = adaln_wb[2 * i + 1] if adaln_wb is not None else None
+            x = layer(x, c, input_pos, freqs_cis, mask, context, context_freqs_cis, cross_attention_mask, skip_in_x, attn_wb=attn_wb, ffn_wb=ffn_wb)
             if self.uvit_skip_connection and i in self.layers_emit_skip:
                 skip_in_x_list.append(x)
-        x = self.norm(x, c)
+        norm_wb = adaln_wb[2 * len(self.layers)] if adaln_wb is not None else None
+        x = self.norm(x, c, precomputed_wb=norm_wb)
         return x
 
     @classmethod
@@ -220,22 +242,24 @@ class TransformerBlock(nn.Module):
 
     def forward(self,
                 x: Tensor,
-                c: Tensor,
+                c: Optional[Tensor],
                 input_pos: Tensor,
                 freqs_cis: Tensor,
-                mask: Tensor,
+                mask: Optional[Tensor],
                 context: Optional[Tensor] = None,
                 context_freqs_cis: Optional[Tensor] = None,
                 cross_attention_mask: Optional[Tensor] = None,
                 skip_in_x: Optional[Tensor] = None,
+                attn_wb: Optional[Tensor] = None,
+                ffn_wb: Optional[Tensor] = None,
                 ) -> Tensor:
         c = None if self.time_as_token else c
         if self.uvit_skip_connection and skip_in_x is not None:
             x = self.skip_in_linear(torch.cat([x, skip_in_x], dim=-1))
-        h = x + self.attention(self.attention_norm(x, c), freqs_cis, mask, input_pos)
+        h = x + self.attention(self.attention_norm(x, c, precomputed_wb=attn_wb), freqs_cis, mask, input_pos)
         if self.has_cross_attention:
             h = h + self.cross_attention(self.cross_attention_norm(h, c), freqs_cis, cross_attention_mask, input_pos, context, context_freqs_cis)
-        out = h + self.feed_forward(self.ffn_norm(h, c))
+        out = h + self.feed_forward(self.ffn_norm(h, c, precomputed_wb=ffn_wb))
         return out
 
 
@@ -298,9 +322,24 @@ class Attention(nn.Module):
         if self.kv_cache is not None:
             k, v = self.kv_cache.update(input_pos, k, v)
 
-        k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-        v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
+        if self.n_head != self.n_local_heads:
+            k = k.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+            v = v.repeat_interleave(self.n_head // self.n_local_heads, dim=1)
+        if (
+            mask is None
+            and self.head_dim == 64
+            and q.dtype == torch.float32
+            and q.is_cuda
+            and os.environ.get("S2MEL_OPT") == "1"
+            and torch.backends.cuda.matmul.allow_tf32
+        ):
+            fa_op = _get_tf32_fa_op()
+            if fa_op is not None:
+                y = fa_op(q.contiguous(), k.contiguous(), v.contiguous())
+            else:
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0)
+        else:
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.0)
 
         y = y.transpose(1, 2).contiguous().view(bsz, seqlen, self.head_dim * self.n_head)
 

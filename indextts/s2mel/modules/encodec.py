@@ -217,6 +217,8 @@ class SConv1d(nn.Module):
         kernel_size = (kernel_size - 1) * dilation + 1  # effective kernel size with dilations
         padding_total = kernel_size - stride
         extra_padding = get_extra_padding_for_conv1d(x, kernel_size, stride, padding_total)
+        if padding_total == 0 and extra_padding == 0:
+            return self.conv(x)
         if self.causal:
             # Left padding for causal
             x = pad1d(x, (padding_total, extra_padding), mode=self.pad_mode)

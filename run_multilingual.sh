@@ -16,15 +16,23 @@ export PATH=/opt/cuda/bin:$PATH
 export PYTORCH_ALLOC_CONF=expandable_segments:True
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-REPO=/home/forsen/repos/index-tts-ml
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODELS=/home/forsen/tts_models
 
-# 2026-11-04 speedups (research/speedup_2026-11-03): 12-step s2mel, compiled
-# DiT, fused BigVGAN kernel. Rollback: S2MEL_STEPS=25 S2MEL_COMPILE=0
-# BIGVGAN_CUDA_KERNEL=0.
-export S2MEL_STEPS="${S2MEL_STEPS:-12}"
+# 2026-11-04 speedups (research/speedup_2026-11-03): compiled DiT, fused
+# BigVGAN kernel; 18-step s2mel with custom TF32-FA2 + hoisted invariants.
+# Rollback: S2MEL_STEPS=25 S2MEL_COMPILE=0 BIGVGAN_CUDA_KERNEL=0.
+export S2MEL_STEPS="${S2MEL_STEPS:-18}"
 export S2MEL_COMPILE="${S2MEL_COMPILE:-1}"
 export BIGVGAN_CUDA_KERNEL="${BIGVGAN_CUDA_KERNEL:-1}"
+
+# Custom sm_89 CUDA GPT-2 engine + TF32/hoisted s2mel + dedicated streams.
+# Instant rollback to vLLM + baseline s2mel:
+#   GPT_ENGINE=vllm TTS_TF32=0 S2MEL_OPT=0 TTS_STREAMS=0
+export GPT_ENGINE="${GPT_ENGINE:-cuda}"
+export TTS_TF32="${TTS_TF32:-1}"
+export S2MEL_OPT="${S2MEL_OPT:-1}"
+export TTS_STREAMS="${TTS_STREAMS:-1}"
 
 # --single_engine_lora is the production mode (UNPACK.md): ONE vLLM engine holds
 #   the pristine base weights, the 16 adapter languages attach a per-request
