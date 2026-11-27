@@ -44,6 +44,7 @@ a digit, so training never exercised numbers in ba/tt context either way.
 
 from __future__ import annotations
 
+import os
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -228,6 +229,8 @@ _QUOTE_FOLD = {
     "ʻ": "'", "ʼ": "'", "ʿ": "'", "ʾ": "'", "`": "'", "´": "'",
 }
 _DASH_FOLD = {c: "-" for c in "‐‑‒⁃−·"}
+# gated additions (see TEXT_FRONTEND_V2): U+2013 EN DASH and U+2014 EM DASH
+_DASH_FOLD_V2 = {**_DASH_FOLD, "–": "-", "—": "-"}
 # Combining acute/grave: Russian and Ukrainian stress marks. They are a reading aid,
 # never part of the orthography, and they would otherwise mint junk BPE pieces.
 _COMBINING_STRESS = "̀́"
@@ -394,6 +397,29 @@ def expand_symbols(text: str, spec: LangSpec) -> str:
 # Public API
 # --------------------------------------------------------------------------------------
 
+# ONE gate for every text-frontend change that alters what the model sees, so the serve
+# side can never be flipped for one fix and not another. Controlled by TEXT_FRONTEND_V2=1
+# in the environment (defaults off so v1 checkpoints stay bit-identical). Flip ONLY
+# together with a v2 checkpoint trained on data/processed_fixed. Covers (STATE 15-M, 15-R):
+#   1. Turkish i->İ / ı->I  (locale-naive .upper() merged /i/ and /ɯ/)
+#   2. U+2013 EN DASH folded to "-"  (was a second token for the same dialogue dash)
+#   3. whole-line wrapping quotes stripped  (injected 16k apostrophes into Polish)
+TEXT_FRONTEND_V2 = os.environ.get("TEXT_FRONTEND_V2", "0") == "1"
+
+
+_WRAPPING_QUOTES = '"“”«»„'
+
+
+def _strip_wrapping_quotes(text: str) -> str:
+    """Drop a quote pair wrapping the WHOLE line (mirrors data_prep). Inner quotes kept."""
+    t = text.strip()
+    if len(t) > 2 and t[0] in _WRAPPING_QUOTES and t[-1] in _WRAPPING_QUOTES:
+        inner = t[1:-1]
+        if not any(c in _WRAPPING_QUOTES for c in inner):
+            return inner.strip()
+    return text
+
+
 def sanitize(text: str, lang: str) -> str:
     """Full conditioning for `lang`, matching what training did to the corpus.
 
@@ -422,12 +448,17 @@ def sanitize(text: str, lang: str) -> str:
 
     t = unicodedata.normalize("NFKC", text or "").strip()
     t = t.replace(" ", " ").replace("　", " ")
-    t = "".join(_QUOTE_FOLD.get(c, _DASH_FOLD.get(c, c)) for c in t
+    if TEXT_FRONTEND_V2:
+        t = _strip_wrapping_quotes(t)
+    _dash = _DASH_FOLD_V2 if TEXT_FRONTEND_V2 else _DASH_FOLD
+    t = "".join(_QUOTE_FOLD.get(c, _dash.get(c, c)) for c in t
                 if c not in _COMBINING_STRESS)
     if spec.script == "cyrillic":
         t = _fold_confusables(t, spec.code)
     t = expand_symbols(t, spec)
     t = verbalize_numbers(t, spec)
+    if TEXT_FRONTEND_V2 and spec.code == "tr":
+        t = t.replace("i", "İ").replace("ı", "I")
     # Collapse whitespace and tidy punctuation spacing introduced by the expansions.
     t = _WS_RE.sub(" ", t)
     t = re.sub(r"\s+([,.!?;:…])", r"\1", t)

@@ -35,6 +35,13 @@ export S2MEL_OPT="${S2MEL_OPT:-1}"
 export S2MEL_BF16="${S2MEL_BF16:-1}"
 export TTS_STREAMS="${TTS_STREAMS:-1}"
 
+# Adapter checkpoint + matching text front-end (flip together).
+# Instant rollback to v1:
+#   ADAPTER_MODEL=lora_step12000 LORA_PEFT=lora_peft_step12000 TEXT_FRONTEND_V2=0
+ADAPTER_MODEL="${ADAPTER_MODEL:-lora_v2_step12000}"
+LORA_PEFT="${LORA_PEFT:-lora_peft_v2_step12000}"
+export TEXT_FRONTEND_V2="${TEXT_FRONTEND_V2:-1}"
+
 # --single_engine_lora is the production mode (UNPACK.md): ONE vLLM engine holds
 #   the pristine base weights, the 16 adapter languages attach a per-request
 #   LoRA, en/zh run bit-exact base. The two KV budgets are summed into one
@@ -49,10 +56,10 @@ LD_PRELOAD=$REPO/fake_dns.so \
     --host 0.0.0.0 \
     --port 5113 \
     --base_model_dir "$MODELS/base_pristine" \
-    --adapter_model_dir "$MODELS/lora_step12000" \
+    --adapter_model_dir "$MODELS/$ADAPTER_MODEL" \
     --lid_model "$MODELS/glotlid/model.bin" \
     --single_engine_lora \
-    --lora_peft_dir "$MODELS/lora_peft_step12000" \
+    --lora_peft_dir "$MODELS/$LORA_PEFT" \
     --gpu_memory_utilization 0.10 \
     --base_kv_cache_memory_bytes 1000000000 \
     --adapter_kv_cache_memory_bytes 2500000000 \
