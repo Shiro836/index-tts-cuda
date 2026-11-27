@@ -234,3 +234,33 @@ def test_ba_hundred_and_thousand_take_no_ber():
 
 def test_tt_zero():
     assert "ноль" in sanitize("0 булды", "tt").lower()
+
+
+# ---------------------------------------------------------------------------------------
+# TEXT_FRONTEND_V2 (paired with lora_v2_step12000)
+# ---------------------------------------------------------------------------------------
+
+def test_frontend_v2_turkish_dotted_i(monkeypatch):
+    import indextts.text_frontend_serve as tfs
+    monkeypatch.setattr(tfs, "TEXT_FRONTEND_V2", True)
+    out = sanitize("Gelir misin, kalır mısın?", "tr")
+    assert "mİsİn" in out
+    assert "mIsIn" in out
+    assert out.upper().count("İ") == 3  # Gelİr(1) + mİsİn(2)
+
+
+def test_frontend_v2_en_dash_and_wrapping_quotes(monkeypatch):
+    import indextts.text_frontend_serve as tfs
+    monkeypatch.setattr(tfs, "TEXT_FRONTEND_V2", True)
+    assert sanitize("опір – як", "uk") == "опір - як"
+    assert sanitize('"Czy możemy zacząć?"', "pl") == "Czy możemy zacząć?"
+    # Inner quotes must survive
+    assert sanitize('Powiedział "tak" i poszedł.', "pl") == 'Powiedział "tak" i poszedł.'
+
+
+def test_frontend_v1_flag_off_keeps_legacy_behavior(monkeypatch):
+    import indextts.text_frontend_serve as tfs
+    monkeypatch.setattr(tfs, "TEXT_FRONTEND_V2", False)
+    assert "İ" not in sanitize("misin", "tr")
+    assert "–" in sanitize("опір – як", "uk")
+    assert sanitize('"Czy możemy?"', "pl").startswith('"')
